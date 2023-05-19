@@ -2,4 +2,8 @@
 Allows you to inject one or more dlls into an executable exe file
 
 ## How to?
-start program and inject dll by one click. Usage: launch Game.exe MyLib.dll [command line]
+Launch and injecting program in one click, supported injecting multiple dlls.
+Usage:
+Game.exe appname mylib1 mylib2 mylib3 and more
+Game.exe appname directorywithlibsname
+And any combinations. You can rename injector to appname_mylib1_mylib2_directorywithmylibs.exe(example) and use without cmdline
