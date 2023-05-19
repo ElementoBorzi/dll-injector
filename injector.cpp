@@ -1,123 +1,194 @@
-#include <Windows.h>
-#include <cstdio>
+#include <boost/program_options.hpp>
+#include <boost/filesystem.hpp>
+#include <windows.h>
+#include <tlhelp32.h>
 #include <string>
-#include <vector>
-#include <filesystem>
-#define TIMEFORWAIT 10 * 1000 // 10 seconds
+#include <iostream>
 
-namespace fs = std::filesystem;
+namespace po = boost::program_options;
+namespace fs = boost::filesystem;
+typedef LONG (NTAPI *NtSuspendProcess)(HANDLE ProcessHandle);
+typedef LONG (NTAPI *NtResumeProcess)(HANDLE ProcessHandle);
 
-std::string cmdLine, exePath;
-std::vector<std::string> dllPaths;
 
-void error(const char* format, ...)
+void OpenConsole()
 {
-	printf("fail: ");
-	va_list argptr;
-	va_start(argptr, format);
-	printf(format, argptr);
-	va_end(argptr);
-	printf("\r\n");
-	
-	getchar();
-	exit(0);
+	static bool isConsoleShown = false;
+	if (!isConsoleShown) {
+		AttachConsole(ATTACH_PARENT_PROCESS);
+		AllocConsole();
+		freopen("CONIN$","r",stdin);
+		freopen("CONOUT$","w",stdout);
+		freopen("CONOUT$","w",stderr);
+
+		isConsoleShown = true;
+	}
 }
 
-void error_usage()
+void Notify(const char* message,...)
 {
-   error("Usage:"
-		"\t-c \"cmd line\" -- pass command line to executable\n"
-		"\t-l \"path\" -- insert dll to injecting queue\n"
-		"\t-d \"path\" -- insert directory to inject queue\n"
-		"\t-e \"path\" -- assing executable file\n"
-	);
+	OpenConsole();
+
+	va_list args;
+	va_start(args,message);	
+	vprintf(message,args);
+	va_end(args);
+
+	system("pause");
 }
 
-void ParseCommandLineOptions(int argc, char* argv[])
+void ErrorOccured(const char* message,...)
 {
-	for (int i = 1; i < argc; i += 2){
-		if (argv[i+1][0] && (argv[i][0] == '-' || argv[i][0] == '/')){
-			switch(tolower(argv[i][1])){
-			case 'c':
-				cmdLine.append(argv[i+1]);
-				continue;
-			case 'l':
-				dllPaths.push_back(argv[i+1]);
-				continue;
-			case 'd':
-				if (fs::is_directory(argv[i+1])) {
-					for (const auto& file : fs::directory_iterator(argv[i+1])) {
-						if (file.path().extension().compare(".dll") == 0){
-							dllPaths.push_back(file.path().string());
-						}
-					}
-				}
-				else{
-					error("%s is not directory!\n",argv[i+1]);
-				}
-				continue;
-			case 'e':
-				exePath.append(argv[i+1]);
-				continue;
-			}
+	OpenConsole();
+
+	std::cout << "Error has been occured!" << std::endl;
+	std::cout << "Last error code: " << GetLastError() << std::endl;
+	va_list args;
+	va_start(args,message);	
+	vprintf(message,args);
+	va_end(args);
+
+	system("pause");
+}
+
+bool InjectLibrary(HANDLE hProcess, const char* filePath,DWORD dwMilliseconds = 10 * 1e3)
+{
+	static FARPROC pLoadLibraryA = NULL;
+	if (!pLoadLibraryA) {
+		HMODULE hModule = GetModuleHandleA("kernel32");
+		if (hModule == NULL) return false;
+
+		pLoadLibraryA = GetProcAddress(hModule,"LoadLibraryA");
+		if (!pLoadLibraryA) return false;
+	}
+
+	bool result = false;
+	size_t szBuffer = strlen(filePath) + 1;
+	if (void* lpBuffer = VirtualAllocEx(hProcess,NULL,szBuffer,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE)) {
+		SIZE_T bytesWritten = 0;
+		if (WriteProcessMemory(hProcess,lpBuffer,filePath,szBuffer,&bytesWritten) && bytesWritten == szBuffer) {
+			if (HANDLE hThread = CreateRemoteThread(hProcess,NULL,0,(LPTHREAD_START_ROUTINE)pLoadLibraryA,lpBuffer,0,NULL))
+				result = (WaitForSingleObject(hThread,dwMilliseconds) == WAIT_OBJECT_0);
+		}
+		
+		VirtualFreeEx(hProcess,lpBuffer,szBuffer,MEM_RELEASE);
+	}
+
+	return result;
+}
+
+void InjectLibraryList(HANDLE hProcess, const std::vector<std::string>& dllList)
+{
+	for (const auto& pathDll : dllList) {
+		if (!fs::is_regular_file(pathDll) || fs::extension(pathDll).compare(".dll") != 0) {
+			ErrorOccured("Library file invalid! File name: %s\n",pathDll.c_str());
+			continue;
 		}
 
-		error_usage();
-	}
-}
-
-bool Inject(HANDLE hProcess, const std::string& dllPath, FARPROC procLoadLibraryA)
-{
-	bool res = false;
-		if (auto lpAddr = VirtualAllocEx(hProcess, NULL, dllPath.size(), MEM_COMMIT, PAGE_READWRITE)) {
-			if (WriteProcessMemory(hProcess, lpAddr, dllPath.c_str(), dllPath.size(), NULL)) {
-				if (auto hThread = CreateRemoteThread(hProcess, FALSE, 0, (LPTHREAD_START_ROUTINE)procLoadLibraryA, lpAddr , 0, NULL)) {
-					res = WaitForSingleObject(hThread, TIMEFORWAIT) == WAIT_OBJECT_0;
-					CloseHandle(hThread);
-				}
-			}
-		VirtualFreeEx(hProcess, lpAddr, dllPath.size(), MEM_FREE);
+		std::string absolutePathDll = boost::filesystem::absolute(pathDll).string();
+		if (!InjectLibrary(hProcess,absolutePathDll.c_str())) {
+			ErrorOccured("InjectLibrary() fail! File path: %s\n",absolutePathDll.c_str());
+			continue;
 		}
-	
-	return res;
-
+	}
 }
 
-int main(int argc, char* argv[])
+bool ExecFile(const std::string& exe, const std::string& cmdline, PROCESS_INFORMATION& pInfo)
 {
-	printf("Visit program homepage https://github.com/ElementoBorzi/dll-injector\n");
+	memset(&pInfo,NULL,sizeof(pInfo));
 
-	ParseCommandLineOptions(argc,argv);
+	STARTUPINFOA sInfo;
+	memset(&sInfo,NULL,sizeof(sInfo));
+	sInfo.cb = sizeof(sInfo);
 
-	if (exePath.empty())
-		error("path of executable file is not assigned.\n");
+	std::string formatedCmdLine;
+	formatedCmdLine.append("\"").append(exe).append("\" ").append(cmdline);
 
+	std::string pathParent = fs::absolute(exe).parent_path().string();
+	return NULL != CreateProcessA(exe.c_str(),(char*)formatedCmdLine.c_str(),NULL,NULL,FALSE,CREATE_SUSPENDED,NULL,pathParent.c_str(),&sInfo,&pInfo);
+}
 
-	if (!fs::exists(exePath))
-		error("executable file is not exists.\n");
+std::vector<DWORD> GetPidListByName(const std::string& processName)
+{
+	std::vector<DWORD> result;
+	PROCESSENTRY32 processEntry;
+	memset(&processEntry,NULL,sizeof(processEntry));
+	processEntry.dwSize = sizeof(processEntry);
 
-	for (const auto& val : dllPaths){
-		if (!fs::exists(val))
-			error("dll file %s is not exists!\n",val.c_str());
+	if (HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,NULL); hSnapshot != INVALID_HANDLE_VALUE) {
+		if (Process32First(hSnapshot,&processEntry)) {
+			do {
+				if (strcmp(processEntry.szExeFile,processName.c_str()) == 0)
+					result.push_back(processEntry.th32ProcessID);
+			} while(Process32Next(hSnapshot,&processEntry));
+		}
+
+		CloseHandle(hSnapshot);
 	}
 
-	STARTUPINFOA sInfo = { sizeof(STARTUPINFOA) };
-	PROCESS_INFORMATION pInfo;
+	return result;
+}
 
-	if (!CreateProcessA(exePath.c_str(), cmdLine.data(), NULL, NULL, FALSE, 0, NULL, NULL, &sInfo, &pInfo)){
-		DWORD* exitCode = NULL;
-		GetExitCodeProcess(pInfo.hProcess, exitCode);
-		error("process creating error code: %lu\n", exitCode);
+int main(int argc, char** argv)
+{
+	std::vector<std::string> dllList;
+	std::string exe,cmdline;
+	bool isInLauncherMode;
+	{
+		po::variables_map vm;
+		po::options_description desc("Allowed options");
+		desc.add_options()
+			("help,h","show help")
+			("launchermode,l","mode with start exe file")
+			("pause,p","pause beetwen start exe and injecting (used in launchermode only)")
+			("exe,e",po::value<std::string>(&exe),"launchermode - path to exe file, overtwice process name [REQUIRED]")
+			("dll,d",po::value<std::vector<std::string>>(&dllList)->multitoken(),"path to dll library (can be used one more times)")
+			("cmdline,c",po::value<std::string>(&cmdline),"cmdline for pass to executable");
+
+		po::store(po::parse_command_line(argc,argv,desc),vm);
+		po::notify(vm);
+
+		if (vm.count("help") || !vm.count("exe")) {
+			OpenConsole();
+			std::cout << desc << std::endl;
+			system("pause");
+			return 0;
+		}
+
+		isInLauncherMode = vm.count("launchermode") != 0;
 	}
 
-	HMODULE hKernel = GetModuleHandleA("kernel32");
-	FARPROC procLoadLibraryA = GetProcAddress(hKernel, "LoadLibraryA");
+	if (isInLauncherMode) {
+		PROCESS_INFORMATION pInfo;
+		if (!ExecFile(exe,cmdline,pInfo)) {
+			ErrorOccured("CreateProcess() fail!");
+			return 0;
+		}
+		
+		InjectLibraryList(pInfo.hProcess,dllList);
+		ResumeThread(pInfo.hThread);
+		CloseHandle(pInfo.hThread);
+		CloseHandle(pInfo.hProcess);
+	}
+	else {
+		HMODULE hNtDll = GetModuleHandleA("ntdll");
+		auto pNtSuspendProcess = (NtSuspendProcess)GetProcAddress(hNtDll,"NtSuspendProcess");
+		auto pNtResumeProcess = (NtResumeProcess)GetProcAddress(hNtDll,"NtResumeProcess");
 
-	for (const auto& val : dllPaths){
-		if (!Inject(pInfo.hProcess, val, procLoadLibraryA))
-			error("can't inject %s\n", val.c_str());
+		std::vector<DWORD> pIdList = GetPidListByName(exe);
+		while (pIdList.empty()) {
+			Notify("Process not found! First run \"%s\"\n",exe.c_str());
+			pIdList = GetPidListByName(exe);
+		}
+
+		for (const auto& pId : pIdList) {
+			if (HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS,FALSE,pId); hProcess != INVALID_HANDLE_VALUE) {
+				pNtSuspendProcess(hProcess);
+				InjectLibraryList(hProcess,dllList);
+				pNtResumeProcess(hProcess);
+			}
+		}
 	}
 
 	return 0;
-
 }
